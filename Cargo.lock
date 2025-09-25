@@ -6302,6 +6302,7 @@ dependencies = [
  "ctor",
  "dashmap 6.1.0",
  "derive_more",
+ "dirs-next",
  "eyre",
  "futures",
  "futures-util",
