@@ -1,6 +1,7 @@
-use alloy_consensus::transaction::TxHashRef;
-use alloy_consensus::{Eip658Value, Transaction, conditional::BlockConditionalAttributes};
 use alloy_eips::{Encodable2718, Typed2718};
+use alloy_consensus::{
+    Eip658Value, Transaction, conditional::BlockConditionalAttributes, transaction::TxHashRef,
+};
 use alloy_evm::Database;
 use alloy_op_evm::block::receipt_builder::OpReceiptBuilder;
 use alloy_primitives::{BlockHash, Bytes, U256};

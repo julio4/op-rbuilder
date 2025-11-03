@@ -906,6 +906,7 @@ where
         simulation_state.transition_state = simulation_transition_state;
 
         // Refresh pool txs
+        let best_txs_start_time = Instant::now();
         best_txs.refresh_iterator(
             BestPayloadTransactions::new(
                 self.pool
@@ -914,7 +915,15 @@ where
             ),
             ctx.flashblock_index(),
         );
+        let transaction_pool_fetch_time = best_txs_start_time.elapsed();
+        ctx.metrics
+            .transaction_pool_fetch_duration
+            .record(transaction_pool_fetch_time);
+        ctx.metrics
+            .transaction_pool_fetch_gauge
+            .set(transaction_pool_fetch_time);
 
+        let tx_execution_start_time = Instant::now();
         ctx.execute_best_transactions(
             &mut simulation_info,
             &mut simulation_state,
@@ -923,6 +932,13 @@ where
             target_da_for_batch,
         )
         .wrap_err("failed to execute best transactions")?;
+        let payload_transaction_simulation_time = tx_execution_start_time.elapsed();
+        ctx.metrics
+            .payload_transaction_simulation_duration
+            .record(payload_transaction_simulation_time);
+        ctx.metrics
+            .payload_transaction_simulation_gauge
+            .set(payload_transaction_simulation_time);
 
         // Try early return condition
         if block_cancel.is_cancelled() {
@@ -953,24 +969,41 @@ where
         }
 
         // build block and return new best
-        build_block(
+        let total_block_built_duration = Instant::now();
+
+        let build_result = build_block(
             &mut simulation_state,
             ctx,
             &mut simulation_info,
             ctx.extra_ctx.disable_state_root || ctx.attributes().no_tx_pool,
-        )
-        .map(|(payload, mut fb)| {
-            fb.index = ctx.flashblock_index();
-            fb.base = None;
-            Some((
-                payload,
-                fb,
-                simulation_info,
-                simulation_state.cache,
-                simulation_state.transition_state,
-            ))
-        })
-        .wrap_err("failed to build payload")
+        );
+
+        let total_block_built_duration = total_block_built_duration.elapsed();
+        ctx.metrics
+            .total_block_built_duration
+            .record(total_block_built_duration);
+        ctx.metrics
+            .total_block_built_gauge
+            .set(total_block_built_duration);
+
+        match build_result {
+            Err(err) => {
+                ctx.metrics.invalid_built_blocks_count.increment(1);
+                Err(err).wrap_err("failed to build payload")
+            }
+            Ok((payload, mut fb)) => {
+                fb.index = ctx.flashblock_index();
+                fb.base = None;
+
+                Ok(Some((
+                    payload,
+                    fb,
+                    simulation_info,
+                    simulation_state.cache,
+                    simulation_state.transition_state,
+                )))
+            }
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -986,13 +1019,27 @@ where
         best_txs: &mut NextBestFlashblocksTxs<Pool>,
         block_cancel: &CancellationToken,
         best_payload: &BlockCell<OpBuiltPayload>,
-        _span: &tracing::Span,
+        span: &tracing::Span,
     ) -> eyre::Result<Option<FlashblocksExtraCtx>> {
         // 1. --- Prepare shared context ---
 
-        // Add top of block builder txns
+        let flashblock_index = ctx.flashblock_index();
         let mut target_gas_for_batch = ctx.extra_ctx.target_gas_for_batch;
         let mut target_da_for_batch = ctx.extra_ctx.target_da_for_batch;
+        info!(
+            target: "payload_builder",
+            block_number = ctx.block_number(),
+            flashblock_index,
+            target_gas = target_gas_for_batch,
+            gas_used = info.cumulative_gas_used,
+            target_da = target_da_for_batch,
+            da_used = info.cumulative_da_bytes_used,
+            block_gas_used = ctx.block_gas_limit(),
+            "Building flashblock",
+        );
+        let flashblock_build_start_time = Instant::now();
+
+        // Add top of block builder txns
         let builder_txs = self
             .builder_tx
             .add_builder_txs(&state_provider, info, ctx, state, true)
@@ -1016,6 +1063,13 @@ where
             // If main token got canceled in here that means we received get_payload, and we should drop everything and not update best_payload
             // To ensure that we will return same blocks as rollup-boost (to leverage caches)
             if block_cancel.is_cancelled() {
+                self.record_flashblocks_metrics(
+                    ctx,
+                    info,
+                    ctx.target_flashblock_count(),
+                    span,
+                    "Payload building complete, channel closed or job cancelled",
+                );
                 return Ok(None);
             }
             // interval end: abort worker and publish current best immediately (below)
@@ -1053,7 +1107,7 @@ where
         state.transition_state = transition_state;
 
         // Send payloads
-        let _flashblock_byte_size = self
+        let flashblock_byte_size = self
             .ws_pub
             .publish(&fb_payload)
             .wrap_err("failed to publish flashblock via websocket")?;
@@ -1072,8 +1126,18 @@ where
             .iter()
             .map(|tx| tx.tx_hash())
             .collect::<Vec<_>>();
-        // warn: it also marks the top of blocks builder_txs
         best_txs.mark_commited(batch_new_transactions);
+
+        // Record flashblock build duration
+        ctx.metrics
+            .flashblock_build_duration
+            .record(flashblock_build_start_time.elapsed());
+        ctx.metrics
+            .flashblock_byte_size_histogram
+            .record(flashblock_byte_size as f64);
+        ctx.metrics
+            .flashblock_num_tx_histogram
+            .record(info.executed_transactions.len() as f64);
 
         // Update context for next iteration
         let target_gas_for_batch = ctx.extra_ctx.target_gas_for_batch + ctx.extra_ctx.gas_per_batch;
@@ -1087,6 +1151,16 @@ where
             .extra_ctx
             .clone()
             .next(target_gas_for_batch, target_da_for_batch);
+
+        info!(
+            target: "payload_builder",
+            message = "Flashblock built",
+            flashblock_index,
+            current_gas = info.cumulative_gas_used,
+            current_da = info.cumulative_da_bytes_used,
+            target_flashblocks = ctx.target_flashblock_count(),
+        );
+
         Ok(Some(next_extra_ctx))
     }
 
