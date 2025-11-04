@@ -429,8 +429,7 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
             // Note that we need to use the Option to signal whether the transaction comes from a bundle,
             // otherwise, we would exclude all transactions that are not in the reverted hashes.
             let is_bundle_tx = reverted_hashes.is_some();
-            let exclude_reverting_txs =
-                is_bundle_tx && !reverted_hashes.unwrap().contains(&tx_hash);
+            let exclude_reverting_txs = is_bundle_tx && !reverted_hashes.unwrap().contains(tx_hash);
 
             let log_txn = |result: TxnExecutionResult| {
                 debug!(
