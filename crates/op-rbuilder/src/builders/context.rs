@@ -1,7 +1,7 @@
-use alloy_eips::{Encodable2718, Typed2718};
 use alloy_consensus::{
     Eip658Value, Transaction, conditional::BlockConditionalAttributes, transaction::TxHashRef,
 };
+use alloy_eips::{Encodable2718, Typed2718};
 use alloy_evm::Database;
 use alloy_op_evm::block::receipt_builder::OpReceiptBuilder;
 use alloy_primitives::{BlockHash, Bytes, U256};
@@ -377,11 +377,10 @@ impl<ExtraCtx: Debug + Default> OpPayloadBuilderCtx<ExtraCtx> {
         Ok(info)
     }
 
-    /// Simulates the given best transactions.
-    /// The simulation updates the execution info and commit changes to the db
+    /// Executes the given best transactions and updates the execution info.
     ///
     /// Returns `Ok(Some(())` if the job was cancelled.
-    pub(super) fn simulate_best_transactions<E: Debug + Default>(
+    pub(super) fn execute_best_transactions<E: Debug + Default>(
         &self,
         info: &mut ExecutionInfo<E>,
         db: &mut State<impl Database>,

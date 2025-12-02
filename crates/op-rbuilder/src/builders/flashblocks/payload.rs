@@ -893,8 +893,9 @@ where
         block_cancel: &CancellationToken,
         target_gas_for_batch: u64,
         target_da_for_batch: Option<u64>,
+        target_da_footprint_for_batch: Option<u64>,
     ) -> eyre::Result<Option<FlashblockCandidate>> {
-        // create simulation info and simulation state with same cache and transition state as current state
+        // create simulation info and simulation state with the same cache and transition state as the current state
         let mut simulation_info = info.clone();
         let simulation_cache = state.cache.clone();
         let simulation_transition_state = state.transition_state.clone();
@@ -930,6 +931,7 @@ where
             best_txs,
             target_gas_for_batch.min(ctx.block_gas_limit()),
             target_da_for_batch,
+            target_da_footprint_for_batch,
         )
         .wrap_err("failed to execute best transactions")?;
         let payload_transaction_simulation_time = tx_execution_start_time.elapsed();
@@ -1026,6 +1028,8 @@ where
         let flashblock_index = ctx.flashblock_index();
         let mut target_gas_for_batch = ctx.extra_ctx.target_gas_for_batch;
         let mut target_da_for_batch = ctx.extra_ctx.target_da_for_batch;
+        let mut target_da_footprint_for_batch = ctx.extra_ctx.target_da_footprint_for_batch;
+
         info!(
             target: "payload_builder",
             block_number = ctx.block_number(),
@@ -1035,6 +1039,7 @@ where
             target_da = target_da_for_batch,
             da_used = info.cumulative_da_bytes_used,
             block_gas_used = ctx.block_gas_limit(),
+            target_da_footprint = target_da_footprint_for_batch,
             "Building flashblock",
         );
         let flashblock_build_start_time = Instant::now();
@@ -1048,27 +1053,43 @@ where
                 vec![]
             });
 
-        let builder_tx_gas = builder_txs.iter().map(|t| t.gas_used).sum();
-        let builder_tx_da_size = builder_txs.iter().map(|t| t.da_size).sum();
+        // only reserve builder tx gas / da size that has not been committed yet
+        // committed builder txs would have counted towards the gas / da used
+        let builder_tx_gas = builder_txs
+            .iter()
+            .filter(|tx| !tx.is_top_of_block)
+            .fold(0, |acc, tx| acc + tx.gas_used);
+        let builder_tx_da_size: u64 = builder_txs
+            .iter()
+            .filter(|tx| !tx.is_top_of_block)
+            .fold(0, |acc, tx| acc + tx.da_size);
         target_gas_for_batch = target_gas_for_batch.saturating_sub(builder_tx_gas);
+
         // saturating sub just in case, we will log an error if da_limit too small for builder_tx_da_size
         if let Some(da_limit) = target_da_for_batch.as_mut() {
             *da_limit = da_limit.saturating_sub(builder_tx_da_size);
+        }
+
+        if let (Some(footprint), Some(scalar)) = (
+            target_da_footprint_for_batch.as_mut(),
+            info.da_footprint_scalar,
+        ) {
+            *footprint = footprint.saturating_sub(builder_tx_da_size.saturating_mul(scalar as u64));
         }
 
         let mut best: Option<FlashblockCandidate> = None;
 
         // 2. --- Build candidates and update best ---
         loop {
-            // If main token got canceled in here that means we received get_payload, and we should drop everything and not update best_payload
-            // To ensure that we will return same blocks as rollup-boost (to leverage caches)
+            // If the main token got canceled in here, that means we received get_payload, and we should drop everything and not update best_payload
+            // To ensure that we will return the same blocks as rollup-boost (to leverage caches)
             if block_cancel.is_cancelled() {
                 self.record_flashblocks_metrics(
                     ctx,
                     info,
                     ctx.target_flashblock_count(),
                     span,
-                    "Payload building complete, channel closed or job cancelled",
+                    "Payload building complete, channel closed or job canceled",
                 );
                 return Ok(None);
             }
@@ -1088,6 +1109,7 @@ where
                 block_cancel,
                 target_gas_for_batch,
                 target_da_for_batch,
+                target_da_footprint_for_batch,
             )?;
         }
 
@@ -1139,7 +1161,7 @@ where
             .flashblock_num_tx_histogram
             .record(info.executed_transactions.len() as f64);
 
-        // Update context for next iteration
+        // Update context for the next iteration
         let target_gas_for_batch = ctx.extra_ctx.target_gas_for_batch + ctx.extra_ctx.gas_per_batch;
         let target_da_for_batch = ctx
             .extra_ctx
@@ -1147,10 +1169,18 @@ where
             .zip(ctx.extra_ctx.target_da_for_batch)
             .map(|(da_limit, da)| da + da_limit);
 
-        let next_extra_ctx = ctx
-            .extra_ctx
-            .clone()
-            .next(target_gas_for_batch, target_da_for_batch);
+        if let (Some(footprint), Some(da_footprint_limit)) = (
+            target_da_footprint_for_batch.as_mut(),
+            ctx.extra_ctx.da_footprint_per_batch,
+        ) {
+            *footprint += da_footprint_limit;
+        }
+
+        let next_extra_ctx = ctx.extra_ctx.clone().next(
+            target_gas_for_batch,
+            target_da_for_batch,
+            target_da_footprint_for_batch,
+        );
 
         info!(
             target: "payload_builder",
